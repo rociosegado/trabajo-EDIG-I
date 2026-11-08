@@ -1,0 +1,191 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+//pines 
+const int PIN_BOTON = 2;
+const int PIN_PERILLA_CLK = 8;   
+const int PIN_PERILLA_DT = 9;   
+const int PIN_PERILLA_SW = 10; 
+const int PIN_RUIDO = A0; 
+const int PIN_LED_R = 3; 
+const int PIN_LED_G = 5;
+const int PIN_LED_B = 6;
+
+const unsigned long T_RUIDO = 2000; //el check ruido dura 2s
+const unsigned long T_ANTIRREBOTE = 50; //50 ms
+const int UMBRAL = 600; //los numeros que devuelve van del 0 a 1023
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//estados
+enum Estado { IDLE, CHECK_RUIDO, SELECCION, AVISO, ESPERA_RESPUESTA, MOSTRAR_RESULTADOS};
+enum Opcion { NO, SI };
+Estado estado;
+Opcion opcion;
+int  ultimaLecturaBoton = HIGH,   estadoBoton = HIGH;
+int  ultimaLecturaPerilla = HIGH, estadoPerilla = HIGH;
+unsigned long tCambioBoton = 0,   tCambioPerilla = 0; //son los tiempos en donde hubo cambios en el boton o perilla 
+int  ultimoCLK = HIGH; //esto indica el estado de la perilla, si la persona corrio la perilla esta en low por un instante por el cambio y luego regresa a high 
+int ruido = 0;                   
+unsigned long tInicio = 0; //momento en que se entro al estado
+bool pulsacionNueva(int pin, int &ultimaLectura, int &estadoEstable, unsigned long &tCambio) //estado estable empieza valiendo HIGH 
+{
+  int lectura = digitalRead(pin); //devuelve HIGH o LOW 
+  if (lectura != ultimaLectura) 
+  {
+    tCambio = millis(); //anota el momento en que ocurrio el cambio con millis()
+    ultimaLectura = lectura; //se guarda el cambio 
+  }
+  if (millis()-tCambio > T_ANTIRREBOTE && lectura != estadoEstable) 
+  {
+    estadoEstable = lectura;
+    if (estadoEstable == LOW) return true; // LOW = presionado
+  }
+  return false;
+}
+
+bool botonPresionado() 
+{
+  return pulsacionNueva(PIN_BOTON, ultimaLecturaBoton, estadoBoton, tCambioBoton);
+}
+
+bool perillaPresionada() 
+{
+  return pulsacionNueva(PIN_PERILLA_SW, ultimaLecturaPerilla,estadoPerilla, tCambioPerilla);
+}
+
+//devuelve +1(horario); -1(antihorario) o 0(que indica que no giro)
+int leerGiroPerilla() 
+{
+  int clk = digitalRead(PIN_PERILLA_CLK);
+  int giro = 0;
+  if (clk != ultimoCLK && clk == LOW) //con low se indica que si se corrio la perilla 
+  {
+    giro = (digitalRead(PIN_PERILLA_DT) == HIGH) ? +1 : -1;
+  }
+  ultimoCLK = clk;
+  return giro;
+}
+int leerRuido() 
+{
+  return analogRead(PIN_RUIDO); //devuelve cantidad de electricidad 
+}
+void mostrarLCD(String l1, String l2) 
+{
+  lcd.clear();
+  lcd.setCursor(0, 0); //columna 0 fila 0 
+  lcd.print(l1);
+  lcd.setCursor(0, 1); //columna 0 fila 1
+  lcd.print(l2);
+}
+void mostrarOpcion() 
+{
+  if (opcion == SI) 
+  mostrarLCD("Iniciar prueba?", "  > SI     NO");
+  else  
+  mostrarLCD("Iniciar prueba?", "    SI   > NO");
+}
+
+void setLED(int r, int g, int b) 
+{
+  analogWrite(PIN_LED_R, r);
+  analogWrite(PIN_LED_G, g);
+  analogWrite(PIN_LED_B, b);
+}
+void ledRojo()     
+{setLED(255, 0,   0);}
+void ledAmarillo() 
+{setLED(255, 180, 0);}
+void ledNaranja()  
+{setLED(255, 60,  0);}
+
+void configurarPines() 
+{
+  pinMode(PIN_PERILLA_CLK, INPUT_PULLUP);
+  pinMode(PIN_PERILLA_DT, INPUT_PULLUP);
+  pinMode(PIN_PERILLA_SW, INPUT_PULLUP);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+  pinMode(PIN_RUIDO, INPUT);
+}
+
+//estado inicial, espera que se presione la perilla
+void irAIdle() 
+{
+  setLED(0, 0, 0); //led apagado
+  mostrarLCD("Bienvenido", "Pulse perilla");
+  estado = IDLE;
+}
+
+void actualizarMaquina()
+
+{
+  bool perilla = perillaPresionada();
+  bool boton = botonPresionado();
+  int  giro = leerGiroPerilla();
+  bool timerFin;
+  unsigned long tiempopasado; 
+
+  switch (estado) 
+  {
+    case IDLE:
+      //IDLE -> CHECK_RUIDO
+      if (perilla) 
+      {
+        ledAmarillo();
+        mostrarLCD("Midiendo ruido", "Silencio...");
+        ruido = 0;
+        tInicio = millis(); //timer(2)
+        estado = CHECK_RUIDO;
+      }
+      break;
+
+    case CHECK_RUIDO: 
+      {
+      int lectura = leerRuido();
+      if (lectura > ruido) 
+      ruido = lectura;
+
+      tiempopasado = millis() - tInicio;
+      if (tiempopasado >= T_RUIDO) 
+         timerFin = true;
+       else 
+         timerFin = false;
+      if (timerFin) 
+      {
+        Serial.print("Ruido medido: ");
+        Serial.println(ruido);
+        if (ruido < UMBRAL) 
+        {
+          //CHECK_RUIDO -> SELECCION
+          ledNaranja();
+          opcion = SI;
+          mostrarOpcion();
+          estado = SELECCION;
+        } else 
+        {
+          //CHECK_RUIDO -> IDLE
+          ledRojo();
+          mostrarLCD("Mucho ruido", "Pulse p/reintent");
+          estado = IDLE;
+        }
+      }
+      break;
+      }
+  } 
+}
+
+void setup() 
+{
+  configurarPines();
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  irAIdle();            
+}
+
+void loop() 
+{
+  actualizarMaquina();
+}
