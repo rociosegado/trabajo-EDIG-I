@@ -189,3 +189,308 @@ void loop()
 {
   actualizarMaquina();
 }
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+//pines 
+const int PIN_BOTON = 2;
+const int PIN_PERILLA_CLK = 8;   
+const int PIN_PERILLA_DT = 9;   
+const int PIN_PERILLA_SW = 10; 
+const int PIN_RUIDO = A0; 
+const int PIN_LED_R = 3; 
+const int PIN_LED_G = 5;
+const int PIN_LED_B = 6;
+
+const unsigned long T_RUIDO = 2000; //el check ruido dura 2s
+const unsigned long T_ANTIRREBOTE = 50; //50 ms
+const int UMBRAL = 600; //los numeros que devuelve van del 0 a 1023
+// ============ INICIO DE MI PARTE: constantes y variables (SELECCION y AVISO) ============
+const int PIN_BUZZER = 7;                  // pin del buzzer KY-006 (en el codigo de IDLE/CHECK_RUIDO se usaba sin declararlo)
+const unsigned long T_AVISO = 5000;        // duracion del estado AVISO en milisegundos (5 s)
+const unsigned long T_RESPUESTA = 3000;    // tiempo para responder en ms (3 s); lo usa ESPERA_RESPUESTA
+const int NIVEL_MAX = 14;                  // cantidad de niveles de la prueba (de 1 a 14)
+const int frecuencia[NIVEL_MAX] =          // frecuencia en Hz de cada nivel; el nivel 1 esta en la posicion 0
+  {100, 250, 500, 750, 1000, 2000, 3000, 4000, 5000, 6000, 7000, 8000, 9000, 10000};
+int nivel = 0;                             // nivel actual; arranca en 0 y SELECCION lo pone en 1 al confirmar SI
+// ============ FIN DE MI PARTE ============
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+//estados
+enum Estado { IDLE, CHECK_RUIDO, SELECCION, AVISO, ESPERA_RESPUESTA, MOSTRAR_RESULTADOS};
+enum Opcion { NO, SI };
+Estado estado;
+Opcion opcion;
+int  ultimaLecturaBoton = HIGH,   estadoBoton = HIGH;
+int  ultimaLecturaPerilla = HIGH, estadoPerilla = HIGH;
+unsigned long tCambioBoton = 0,   tCambioPerilla = 0; //son los tiempos en donde hubo cambios en el boton o perilla 
+int  ultimoCLK = HIGH; //esto indica el estado de la perilla, si la persona corrio la perilla esta en low por un instante por el cambio y luego regresa a high 
+int ruido = 0;                   
+unsigned long tInicio = 0; //momento en que se entro al estado
+bool pulsacionNueva(int pin, int &ultimaLectura, int &estadoEstable, unsigned long &tCambio) //estado estable empieza valiendo HIGH 
+{
+  int lectura = digitalRead(pin); //devuelve HIGH o LOW 
+  if (lectura != ultimaLectura) 
+  {
+    tCambio = millis(); //anota el momento en que ocurrio el cambio con millis()
+    ultimaLectura = lectura; //se guarda el cambio 
+  }
+  if (millis()-tCambio > T_ANTIRREBOTE && lectura != estadoEstable) 
+  {
+    estadoEstable = lectura;
+    if (estadoEstable == LOW) return true; // LOW = presionado
+  }
+  return false;
+}
+
+bool botonPresionado() 
+{
+  return pulsacionNueva(PIN_BOTON, ultimaLecturaBoton, estadoBoton, tCambioBoton);
+}
+
+bool perillaPresionada() 
+{
+  return pulsacionNueva(PIN_PERILLA_SW, ultimaLecturaPerilla,estadoPerilla, tCambioPerilla);
+}
+
+//devuelve +1(horario); -1(antihorario) o 0(que indica que no giro)
+int leerGiroPerilla() 
+{
+  int clk = digitalRead(PIN_PERILLA_CLK);
+  int giro = 0;
+  if (clk != ultimoCLK && clk == LOW) //con low se indica que si se corrio la perilla 
+  {
+    giro = (digitalRead(PIN_PERILLA_DT) == HIGH) ? +1 : -1;
+  }
+  ultimoCLK = clk;
+  return giro;
+}
+int leerRuido() 
+{
+  return analogRead(PIN_RUIDO); //devuelve cantidad de electricidad 
+}
+void mostrarLCD(String l1, String l2) 
+{
+  lcd.clear();
+  lcd.setCursor(0, 0); //columna 0 fila 0 
+  lcd.print(l1);
+  lcd.setCursor(0, 1); //columna 0 fila 1
+  lcd.print(l2);
+}
+void mostrarOpcion() 
+{
+  if (opcion == SI) 
+  mostrarLCD("Iniciar prueba?", "  > SI     NO");
+  else  
+  mostrarLCD("Iniciar prueba?", "    SI   > NO");
+}
+
+void setLED(int r, int g, int b) 
+{
+  analogWrite(PIN_LED_R, r);
+  analogWrite(PIN_LED_G, g);
+  analogWrite(PIN_LED_B, b);
+}
+void ledRojo()     
+{setLED(255, 0,   0);}
+void ledAmarillo() 
+{setLED(255, 180, 0);}
+void ledNaranja()  
+{setLED(255, 60,  0);}
+
+void configurarPines() 
+{
+  pinMode(PIN_PERILLA_CLK, INPUT_PULLUP);
+  pinMode(PIN_PERILLA_DT, INPUT_PULLUP);
+  pinMode(PIN_PERILLA_SW, INPUT_PULLUP);
+  pinMode(PIN_BOTON, INPUT_PULLUP);
+  pinMode(PIN_BUZZER, OUTPUT);
+  pinMode(PIN_LED_R, OUTPUT);
+  pinMode(PIN_LED_G, OUTPUT);
+  pinMode(PIN_LED_B, OUTPUT);
+  pinMode(PIN_RUIDO, INPUT);
+}
+
+//estado inicial, espera que se presione la perilla
+void irAIdle() 
+{
+  setLED(0, 0, 0); //led apagado
+  mostrarLCD("Bienvenido", "Pulse perilla");
+  estado = IDLE;
+}
+
+// ============ INICIO DE MI PARTE: funciones (SELECCION y AVISO) ============
+
+void ledVerde()                            // pone el LED RGB en verde (mismo estilo que ledRojo/ledAmarillo de mi companera)
+{setLED(0, 255, 0);}                       // rojo 0, verde al maximo, azul 0
+
+void emitirTono(int frec)                  // hace sonar el buzzer a la frecuencia frec (en Hz)
+{
+  tone(PIN_BUZZER, frec);                  // tone() no bloquea: el sonido sigue mientras el programa hace otras cosas
+}
+
+void apagarTono()                          // apaga el buzzer
+{
+  noTone(PIN_BUZZER);                      // corta el sonido en el pin del buzzer
+}
+
+// acciones compartidas por T4 y T6: entrar al estado AVISO
+void irAAviso()
+{
+  ledAmarillo();                           // LED amarillo: se esta avisando que viene un tono
+  mostrarLCD("Nivel " + String(nivel) + "/" + String(NIVEL_MAX), ""); // linea 1: "Nivel N/14"; linea 2 vacia
+  tInicio = millis();                      // anota el momento de entrada: equivale a timer(5)
+  estado = AVISO;                          // cambia el estado actual a AVISO
+}
+
+// estado SELECCION: recibe las lecturas que actualizarMaquina() ya hizo en esta vuelta
+void estadoSeleccion(bool perilla, int giro)
+{
+  if (giro != 0)                           // si la perilla giro (+1 o -1)...
+  {
+    opcion = (opcion == SI) ? NO : SI;     // ...alterna la opcion: si estaba en SI pasa a NO y viceversa
+    mostrarOpcion();                       // redibuja el LCD con la opcion marcada
+  }
+
+  if (perilla)                             // si se apreto la perilla, se confirma la opcion elegida
+  {
+    if (opcion == SI)                      // eligio SI
+    {
+      //SELECCION -> AVISO (T4)
+      Serial.println("T4: SELECCION -> AVISO"); // mensaje en el Monitor Serie para seguir el flujo
+      nivel = 1;                           // la prueba empieza en el nivel 1
+      irAAviso();                          // LED amarillo, LCD "Nivel 1/14", timer(5) y estado = AVISO
+    } else                                 // eligio NO
+    {
+      //SELECCION -> IDLE (T10)
+      Serial.println("T10: SELECCION -> IDLE"); // mensaje en el Monitor Serie
+      irAIdle();                           // vuelve al estado de reposo con la funcion de mi companera
+    }
+  }
+}
+
+// estado AVISO: espera 5 s y despues hace sonar el tono del nivel
+// el boton que se apriete durante el aviso se descarta solo: actualizarMaquina() ya lo leyo y aca no se usa (BOTON=NONE)
+void estadoAviso()
+{
+  if (millis() - tInicio >= T_AVISO)       // pasaron 5 s desde que entre al estado: timer_fin == 1
+  {
+    //AVISO -> ESPERA_RESPUESTA (T5)
+    ledVerde();                            // LED verde: ahora el paciente tiene que responder. Va ANTES del tono porque tone() usa el mismo timer que el PWM del pin 3 (rojo)
+    mostrarLCD("Apriete si oye", "");      // le indica al paciente que apriete el boton si escucha el tono
+    emitirTono(frecuencia[nivel - 1]);     // suena la frecuencia del nivel actual (nivel 1 = posicion 0, por eso nivel - 1)
+    tInicio = millis();                    // reinicia el reloj: equivale a timer(3) para el tiempo de respuesta
+    Serial.print("T5: AVISO -> ESPERA_RESPUESTA | nivel "); // mensaje en el Monitor Serie, parte 1
+    Serial.print(nivel);                   // numero de nivel
+    Serial.print(" | ");                   // separador
+    Serial.print(frecuencia[nivel - 1]);   // frecuencia que esta sonando
+    Serial.println(" Hz");                 // unidad y salto de linea
+    estado = ESPERA_RESPUESTA;             // cambia el estado actual a ESPERA_RESPUESTA
+  }
+}
+
+// ============ FIN DE MI PARTE ============
+
+void actualizarMaquina()
+
+{
+  bool perilla = perillaPresionada();
+  bool boton = botonPresionado();
+  int  giro = leerGiroPerilla();
+  bool timerFin;
+  unsigned long tiempopasado; 
+
+  switch (estado) 
+  {
+    case IDLE:
+      //IDLE -> CHECK_RUIDO
+      if (perilla) 
+      {
+        ledAmarillo();
+        mostrarLCD("Midiendo ruido", "Silencio...");
+        ruido = 0;
+        tInicio = millis(); //timer(2)
+        estado = CHECK_RUIDO;
+      }
+      break;
+
+    case CHECK_RUIDO: 
+      {
+      int lectura = leerRuido();
+      if (lectura > ruido) 
+      ruido = lectura;
+
+      tiempopasado = millis() - tInicio;
+      if (tiempopasado >= T_RUIDO) 
+         timerFin = true;
+       else 
+         timerFin = false;
+      if (timerFin) 
+      {
+        Serial.print("Ruido medido: ");
+        Serial.println(ruido);
+        if (ruido < UMBRAL) 
+        {
+          //CHECK_RUIDO -> SELECCION
+          ledNaranja();
+          opcion = SI;
+          mostrarOpcion();
+          estado = SELECCION;
+        } else 
+        {
+          //CHECK_RUIDO -> IDLE
+          ledRojo();
+          mostrarLCD("Mucho ruido", "Pulse p/reintent");
+          estado = IDLE;
+        }
+      }
+      break;
+      }
+
+    // ============ INICIO DE MIS CASES ============
+    case SELECCION:                                        // cuando el estado actual es SELECCION...
+      estadoSeleccion(perilla, giro);                      // ...se ejecuta mi funcion con las lecturas de esta vuelta
+      break;                                               // sale del switch
+
+    case AVISO:                                            // cuando el estado actual es AVISO...
+      estadoAviso();                                       // ...se ejecuta mi funcion
+      break;                                               // sale del switch
+
+    // ---- SOLO PARA PROBAR: borrar cuando este el ESPERA_RESPUESTA real de tu companero/a ----
+    case ESPERA_RESPUESTA:                                 // cuando el estado actual es ESPERA_RESPUESTA...
+      if (boton)                                           // ...si el paciente apreto el boton
+      {
+        apagarTono();                                      // apaga el tono
+        if (nivel < NIVEL_MAX)                             // si todavia quedan niveles
+        {
+          Serial.println("(prueba) ESPERA_RESPUESTA -> AVISO"); // mensaje en el Monitor Serie
+          nivel = nivel + 1;                               // sube al nivel siguiente
+          irAAviso();                                      // vuelve a AVISO con el nivel nuevo
+        } else                                             // si era el ultimo nivel
+        {
+          Serial.println("(prueba) ultimo nivel -> IDLE"); // mensaje en el Monitor Serie
+          irAIdle();                                       // termina y vuelve a IDLE (provisorio)
+        }
+      } else if (millis() - tInicio >= T_RESPUESTA)        // si no apreto y pasaron 3 s
+      {
+        apagarTono();                                      // apaga el tono
+        Serial.println("(prueba) sin respuesta -> IDLE");  // mensaje en el Monitor Serie
+        irAIdle();                                         // termina y vuelve a IDLE (provisorio)
+      }
+      break;                                               // sale del switch
+    // ============ FIN DE MIS CASES ============
+  } 
+}
+
+void setup() 
+{
+  configurarPines();
+  Serial.begin(9600);
+  lcd.init();
+  lcd.backlight();
+  irAIdle();            
+}
+
+void loop() 
+{
+  actualizarMaquina();
+}
